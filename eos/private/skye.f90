@@ -31,7 +31,7 @@ module skye
       private
       public :: Get_Skye_EOS_Results, Get_Skye_alfa, Get_Skye_alfa_simple, get_Skye_for_eosdt
 
-      ! savethesun skye dxa: analytic composition partials, opt-in via MESA_SKYE_DXA=1
+      ! savethesun skye dxa: analytic composition partials, on by default (MESA_SKYE_DXA=0 turns off)
       logical, save :: skye_dxa_checked = .false., skye_dxa_on = .false.
 
       contains
@@ -43,7 +43,7 @@ module skye
 !$OMP critical (skye_dxa_init)
             if (.not. skye_dxa_checked) then
                call get_environment_variable('MESA_SKYE_DXA', v, status=st)
-               skye_dxa_on = (st == 0 .and. len_trim(v) > 0 .and. trim(v) /= '0')
+               skye_dxa_on = .not. (st == 0 .and. trim(v) == '0')
 !$OMP flush
                skye_dxa_checked = .true.
             end if

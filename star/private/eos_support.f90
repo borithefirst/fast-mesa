@@ -40,7 +40,7 @@ module eos_support
 
   integer, parameter :: MAX_ITER_FOR_SOLVE = 100
 
-  ! savethesun eos memo: per-cell memo of get_eos keyed on the exact bits of all inputs (opt-in: MESA_EOS_MEMO=1)
+  ! savethesun eos memo: per-cell memo of get_eos keyed on the exact bits of all inputs (MESA_EOS_MEMO=0 turns off)
   integer, parameter :: memo_slots = 2, memo_ncount = 16
   logical, save :: memo_on = .false., eos_memo_stats_on = .false., memo_checked = .false.
   integer, save :: memo_nz = 0, memo_species = -1, memo_id = -1, memo_handle = -1, memo_last_model = -1
@@ -73,7 +73,7 @@ contains
     integer :: st
     if (.not. memo_checked) then
        call get_environment_variable('MESA_EOS_MEMO', v, status=st)
-       memo_on = (st == 0 .and. len_trim(v) > 0 .and. trim(v) /= '0')
+       memo_on = .not. (st == 0 .and. trim(v) == '0')
        call get_environment_variable('MESA_EOS_MEMO_STATS', v, status=st)
        eos_memo_stats_on = (st == 0 .and. len_trim(v) > 0 .and. trim(v) /= '0')
        call get_environment_variable('MESA_FIXD_MINSTEP', v, status=st)
@@ -89,7 +89,7 @@ contains
        call get_environment_variable('MESA_EOS_DXA_LAG', v, status=st)
        if (st == 0 .and. len_trim(v) > 0) tangent_lag = (trim(v) /= '0')
        call get_environment_variable('MESA_SKYE_DXA', v, status=st)
-       eos_skye_dxa_on = (st == 0 .and. len_trim(v) > 0 .and. trim(v) /= '0')
+       eos_skye_dxa_on = .not. (st == 0 .and. trim(v) == '0')
        call get_environment_variable('MESA_SKYE_DXA_CHECK', v, status=st)
        eos_skye_dxa_check = (st == 0 .and. len_trim(v) > 0 .and. trim(v) /= '0')
        call get_environment_variable('MESA_EOS_DXA_XTOL', v, status=st)

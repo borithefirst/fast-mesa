@@ -15,7 +15,7 @@
  * Production: linked into the star executable (math_init references savethesun_fastcr_link, which pulls
  * this object out of libmath.a) or LD_PRELOADed. The definitions of exp_rd / log_rz interpose the crlibm
  * ones called from libcrmath.so; crlibm's are reached with dlsym(RTLD_NEXT).
- * Opt-in with MESA_FAST_CRLIBM=1 (otherwise every call forwards to crlibm).
+ * On by default; MESA_FAST_CRLIBM=0 makes every call forward to crlibm.
  * Test (-DFASTCR_TEST): defines fast_exp_rd / fast_log_rz, fallback calls crlibm directly, counts
  * fallbacks and exposes the last double-double approximation.
  */
@@ -67,7 +67,7 @@ __attribute__((constructor)) static void fastcr_init(void) {
   real_exp_rd = (fn_t)dlsym(RTLD_NEXT, "exp_rd");
   if (!real_log_rz || !real_exp_rd) { real_log_rz = real_exp_rd = missing; return; }
   const char *e = getenv("MESA_FAST_CRLIBM");
-  if (!(e && e[0] == '1')) return;
+  if (e && e[0] == '0') return;
   if (!HAVE_FMA_CPU()) { printf(" savethesun: MESA_FAST_CRLIBM ignored (CPU has no FMA)\n"); fflush(stdout); return; }
   fastcr_on = 1;
   printf(" savethesun: fast correctly-rounded exp/log front end (crlibm fallback)\n"); fflush(stdout);

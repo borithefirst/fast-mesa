@@ -182,9 +182,9 @@
       end subroutine eval_equations
 
 
-      real(dp) function resid_floor_factor()  ! savethesun resid floor: env MESA_RESID_FLOOR, 0 = off
+      real(dp) function resid_floor_factor()  ! savethesun resid floor: env MESA_RESID_FLOOR (default 1), 0 = off
          logical, save :: checked = .false.
-         real(dp), save :: fac = 0d0
+         real(dp), save :: fac = 1d0
          character(len=64) :: val
          integer :: stat
          if (.not. checked) then

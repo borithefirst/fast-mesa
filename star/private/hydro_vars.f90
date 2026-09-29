@@ -92,7 +92,7 @@
       end subroutine set_vars
 
 
-      logical function lazy_brunt_ok(s)  ! savethesun lazy brunt: env MESA_LAZY_BRUNT=1
+      logical function lazy_brunt_ok(s)  ! savethesun lazy brunt: on unless MESA_LAZY_BRUNT=0
          type (star_info), pointer :: s
          logical, save :: checked = .false., on = .false.
          character(len=16) :: val
@@ -101,7 +101,7 @@
             !$OMP CRITICAL (savethesun_lazy_brunt)
             if (.not. checked) then
                call get_environment_variable('MESA_LAZY_BRUNT', val, status=stat)
-               on = (stat == 0 .and. len_trim(val) > 0 .and. trim(val) /= '0')
+               on = .not. (stat == 0 .and. trim(val) == '0')
                if (on) write(*,'(a)') 'savethesun: lazy Brunt B (skipped in set_vars when unused in-step)'
                checked = .true.
             end if

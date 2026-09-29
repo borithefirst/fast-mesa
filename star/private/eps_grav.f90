@@ -265,9 +265,9 @@
       end subroutine do_lnS_eps_grav
 
 
-      real(dp) function epsg_lin_threshold()  ! savethesun epsg lin: env MESA_EPSG_LIN=<max |dX|>, 0 = off
+      real(dp) function epsg_lin_threshold()  ! savethesun epsg lin: env MESA_EPSG_LIN=<max |dX|> (default 1e-8), 0 = off
          logical, save :: checked = .false.
-         real(dp), save :: thr = 0d0
+         real(dp), save :: thr = 1d-8
          character(len=64) :: val
          integer :: stat
          if (.not. checked) then

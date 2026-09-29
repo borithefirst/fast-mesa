@@ -21,7 +21,7 @@
       module star_solver
 
       use star_private_def
-      use const_def, only: dp, i8
+      use const_def, only: dp, i8, secyer
       use num_def
       use mtx_def
       use mtx_lib, only: block_multiply_xa
@@ -32,6 +32,16 @@
 
       private
       public :: solver
+
+      ! savethesun predictor: set by struct_burn_mix before each solve (0 none, 1 linear, 2 quadratic)
+      integer, public, save :: solver_pred_applied = 0
+      logical, save :: solver_log_checked = .false., solver_log_on = .false.
+      integer, save :: solver_log_unit = 0  ! newunit= gives negative unit numbers
+      logical, save :: solver_trace_checked = .false., solver_trace_on = .false.
+      integer, save :: solver_trace_unit = 0
+      logical, save :: stall_checked = .false.
+      real(dp), save :: stall_cap = 0d0, stall_ratio = 0d0
+      integer, save :: stall_accepted = 0
 
       contains
 
@@ -135,6 +145,8 @@
             tol_residual_norm3, tol_max_residual3, &
             tol_abs_slope_min, tol_corr_resid_product, &
             min_corr_coeff, max_corr_min, max_resid_min, max_abs_correction
+         real(dp) :: init_resid_norm, init_max_resid, corr1_norm, corr1_max, &  ! savethesun predictor
+            tol1_resid_norm, tol1_max_resid, prev_resid_norm
          integer :: nz, iter, max_tries, tiny_corr_cnt, i, &
             force_iter_value, iter_for_resid_tol2, iter_for_resid_tol3, &
             max_corr_k, max_corr_j, max_resid_k, max_resid_j
@@ -263,7 +275,20 @@
                return
             end if
 
-            call do_equations(ierr)
+            if (solver_pred_applied > 0) then  ! savethesun predictor
+               s% solver_iter = 1  ! force set_solver_vars at the predicted state
+               call do_equations(ierr)
+               if (ierr /= 0) then  ! prediction unusable: revert to stock guess
+                  ierr = 0
+                  s% solver_dx(1:nvar,1:nz) = 0d0
+                  if (nvar > s% nvar_hydro) s% xa_sub_xa_start(:,1:nz) = 0d0
+                  solver_pred_applied = -1
+                  call do_equations(ierr)
+               end if
+               s% solver_iter = 0
+            else
+               call do_equations(ierr)
+            end if
             if (ierr /= 0) then
                if (dbg_msg) &
                   write(*, *) 'solver failure: eval_equations returned ierr', ierr
@@ -278,6 +303,16 @@
                convergence_failure = .true.
                return
             end if
+            call solver_trace_line(0, -1d0, -1d0, -1, -1)  ! savethesun predictor
+            init_resid_norm = abs(residual_norm)  ! savethesun predictor
+            init_max_resid = abs(max_residual)
+            corr1_norm = -1d0
+            corr1_max = -1d0
+            tol1_resid_norm = tol_residual_norm
+            tol1_max_resid = tol_max_residual
+            prev_resid_norm = init_resid_norm
+            stall_accepted = 0
+            call stall_init()
 
             first_try = .true.
             iter = 1
@@ -365,6 +400,10 @@
 
                correction_norm = abs(correction_norm)
                max_abs_correction = abs(max_correction)
+               if (iter == 1) then  ! savethesun predictor
+                  corr1_norm = correction_norm
+                  corr1_max = max_abs_correction
+               end if
                corr_norm_min = min(correction_norm, corr_norm_min)
                max_corr_min = min(max_abs_correction, max_corr_min)
 
@@ -484,6 +523,7 @@
 
                residual_norm = abs(residual_norm)
                max_residual = abs(max_residual)
+               call solver_trace_line(iter, correction_norm, max_abs_correction, max_corr_j, max_corr_k)  ! savethesun predictor
                s% residual_norm = residual_norm
                s% max_residual = max_residual
                resid_norm_min = min(residual_norm, resid_norm_min)
@@ -505,6 +545,17 @@
                passed_tol_tests = &
                   (pass_resid_tests .and. pass_corr_tests_with_coeff) .or. &
                   (disabled_resid_tests .and. pass_corr_tests_without_coeff)
+               stall_accepted = 0  ! savethesun predictor
+               if (.not. passed_tol_tests .and. stall_cap > 0d0 .and. iter >= 2 .and. &
+                     .not. disabled_resid_tests .and. pass_corr_tests_with_coeff) then
+                  if (residual_norm <= stall_cap*tol1_resid_norm .and. &
+                        max_residual <= stall_cap*tol1_max_resid .and. &
+                        residual_norm > stall_ratio*prev_resid_norm) then
+                     passed_tol_tests = .true.
+                     stall_accepted = 1
+                  end if
+               end if
+               prev_resid_norm = residual_norm
 
                if (.not. passed_tol_tests) then
 
@@ -612,11 +663,93 @@
 
             end do iter_loop
 
+            call solver_log_line()  ! savethesun predictor
+
             if (max_residual > s% warning_limit_for_max_residual .and. .not. convergence_failure) &
                write(*,2) 'WARNING: max_residual > warning_limit_for_max_residual', &
                   s% model_number, max_residual, s% warning_limit_for_max_residual
 
          end subroutine do_solver_work
+
+
+         subroutine solver_log_line()  ! savethesun predictor
+            character (len=256) :: path
+            integer :: stat, conv
+            if (.not. solver_log_checked) then
+               solver_log_checked = .true.
+               call get_environment_variable('MESA_SOLVER_LOG', path, status=stat)
+               if (stat == 0 .and. len_trim(path) > 0) then
+                  open(newunit=solver_log_unit, file=trim(path), action='write', &
+                     status='replace', iostat=stat)
+                  solver_log_on = (stat == 0)
+                  if (solver_log_on) &
+                     write(solver_log_unit,'(a)') 'model call nz nvar log_dt_yr gold pred ' // &
+                        'tol_resid_norm tol_max_resid init_resid_norm init_max_resid ' // &
+                        'corr1_norm corr1_max tol_corr_norm tol_max_corr iters conv stall'
+               end if
+            end if
+            if (.not. solver_log_on) return
+            conv = 0
+            if (passed_tol_tests .and. .not. convergence_failure) conv = 1
+            write(solver_log_unit,'(i8,i8,i6,i4,f10.4,i3,i3,8es12.4,i5,i3,i3)') &
+               s% model_number, s% solver_call_number, nz, nvar, &
+               log10(max(s% dt, 1d-99)/secyer), gold_tolerances_level, solver_pred_applied, &
+               tol1_resid_norm, tol1_max_resid, init_resid_norm, init_max_resid, &
+               corr1_norm, corr1_max, tol_correction_norm, tol_max_correction, &
+               s% num_solver_iterations, conv, stall_accepted
+            flush(solver_log_unit)
+         end subroutine solver_log_line
+
+
+         subroutine stall_init()  ! savethesun predictor
+            character (len=32) :: val
+            integer :: stat
+            if (stall_checked) return
+            stall_checked = .true.
+            call get_environment_variable('MESA_STALL_CAP', val, status=stat)
+            if (stat == 0) then
+               read(val, *, iostat=stat) stall_cap
+               if (stat /= 0) stall_cap = 0d0
+            end if
+            call get_environment_variable('MESA_STALL_RATIO', val, status=stat)
+            if (stat == 0) then
+               read(val, *, iostat=stat) stall_ratio
+               if (stat /= 0) stall_ratio = 0d0
+            end if
+            if (stall_cap > 0d0) write(*,'(a,2es10.2)') 'savethesun stall-accept cap, ratio', &
+               stall_cap, stall_ratio
+         end subroutine stall_init
+
+
+         subroutine solver_trace_line(it, cnorm, cmax, cj, ck)  ! savethesun predictor
+            ! one line per residual evaluation: it=0 is the initial guess
+            integer, intent(in) :: it, cj, ck
+            real(dp), intent(in) :: cnorm, cmax
+            character (len=256) :: path
+            character (len=16) :: ename, vname
+            integer :: stat
+            if (.not. solver_trace_checked) then
+               solver_trace_checked = .true.
+               call get_environment_variable('MESA_SOLVER_TRACE', path, status=stat)
+               if (stat == 0 .and. len_trim(path) > 0) then
+                  open(newunit=solver_trace_unit, file=trim(path), action='write', &
+                     status='replace', iostat=stat)
+                  solver_trace_on = (stat == 0)
+                  if (solver_trace_on) &
+                     write(solver_trace_unit,'(a)') 'model call pred iter resid_norm max_resid ' // &
+                        'resid_eqn resid_k corr_norm max_corr corr_var corr_k'
+               end if
+            end if
+            if (.not. solver_trace_on) return
+            ename = '-'
+            vname = '-'
+            if (max_resid_j > 0) ename = s% nameofequ(max_resid_j)
+            if (cj > 0) vname = s% nameofvar(cj)
+            write(solver_trace_unit,'(i8,i8,i3,i4,2es12.4,1x,a16,i6,2es12.4,1x,a16,i6)') &
+               s% model_number, s% solver_call_number, solver_pred_applied, it, &
+               abs(residual_norm), abs(max_residual), adjustl(ename), max_resid_k, &
+               cnorm, cmax, adjustl(vname), ck
+         end subroutine solver_trace_line
 
 
          subroutine solver_test_partials(nvar, xder, ierr)

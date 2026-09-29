@@ -28,6 +28,14 @@
       private
       public :: do_struct_burn_mix
 
+      ! savethesun predictor: history of converged per-cell rates dx/dt, keyed by model number
+      integer, parameter :: pred_slots = 3
+      integer, save :: pred_mode = -1
+      integer, save :: pred_model(pred_slots) = -1
+      integer, save :: pred_nz(pred_slots) = 0, pred_nvar(pred_slots) = 0
+      real(dp), save :: pred_dt(pred_slots) = 0d0
+      real(dp), allocatable, save :: pred_rate(:,:,:), pred_qface(:,:), pred_qcell(:,:)
+
       contains
 
       integer function do_struct_burn_mix(s, skip_global_corr_coeff_limit)
@@ -263,6 +271,159 @@
             do_rsp_step = retry
          end if
       end function do_rsp_step
+
+
+      ! savethesun predictor: routines below
+      subroutine pred_init()
+         character (len=32) :: val
+         integer :: stat
+         if (pred_mode >= 0) return
+         pred_mode = 0
+         call get_environment_variable('MESA_PREDICTOR', val, status=stat)
+         if (stat == 0) then
+            read(val, *, iostat=stat) pred_mode
+            if (stat /= 0) pred_mode = 0
+         end if
+         if (pred_mode > 0) write(*,'(a,i2)') 'savethesun predictor mode', pred_mode
+      end subroutine pred_init
+
+
+      subroutine pred_bracket(q, qarr, n, j, w)
+         ! qarr(1:n) is decreasing; find j, w with q ~ (1-w)*qarr(j) + w*qarr(j+1)
+         real(dp), intent(in) :: q, qarr(:)
+         integer, intent(in) :: n
+         integer, intent(out) :: j
+         real(dp), intent(out) :: w
+         integer :: lo, hi, mid
+         if (n < 2 .or. q >= qarr(1)) then
+            j = 1; w = 0d0; return
+         end if
+         if (q <= qarr(n)) then
+            j = n-1; w = 1d0; return
+         end if
+         lo = 1; hi = n
+         do while (hi - lo > 1)
+            mid = (lo + hi)/2
+            if (qarr(mid) >= q) then
+               lo = mid
+            else
+               hi = mid
+            end if
+         end do
+         j = lo
+         w = (qarr(j) - q)/(qarr(j) - qarr(j+1))
+      end subroutine pred_bracket
+
+
+      real(dp) function pred_rate_at(i, slot, q, is_face) result(r)
+         integer, intent(in) :: i, slot
+         real(dp), intent(in) :: q
+         logical, intent(in) :: is_face
+         integer :: j
+         real(dp) :: w
+         if (is_face) then
+            call pred_bracket(q, pred_qface(:,slot), pred_nz(slot), j, w)
+         else
+            call pred_bracket(q, pred_qcell(:,slot), pred_nz(slot), j, w)
+         end if
+         if (pred_nz(slot) < 2) then
+            r = pred_rate(i,1,slot)
+         else
+            r = (1d0 - w)*pred_rate(i,j,slot) + w*pred_rate(i,j+1,slot)
+         end if
+      end function pred_rate_at
+
+
+      subroutine pred_record(s, nvar)
+         ! store converged rates dx/dt of this solve, tagged with its model number
+         type (star_info), pointer :: s
+         integer, intent(in) :: nvar
+         integer :: slot, k, i, nz
+         call pred_init()
+         if (pred_mode <= 0 .or. s% dt <= 0d0) return
+         nz = s% nz
+         if (allocated(pred_rate)) then
+            if (size(pred_rate,1) < nvar .or. size(pred_rate,2) < nz) then
+               deallocate(pred_rate, pred_qface, pred_qcell)
+               pred_model = -1
+            end if
+         end if
+         if (.not. allocated(pred_rate)) then
+            allocate(pred_rate(nvar+8, 2*nz, pred_slots), &
+               pred_qface(2*nz, pred_slots), pred_qcell(2*nz, pred_slots))
+            pred_model = -1
+         end if
+         slot = findloc(pred_model, s% model_number, dim=1)  ! retry/redo of same model
+         if (slot == 0) slot = minloc(pred_model, dim=1)  ! else overwrite the oldest
+         do k = 1, nz
+            pred_qface(k,slot) = s% q(k)
+            pred_qcell(k,slot) = s% q(k) - 0.5d0*s% dq(k)
+            do i = 1, nvar
+               pred_rate(i,k,slot) = s% solver_dx(i,k)/s% dt
+            end do
+         end do
+         pred_model(slot) = s% model_number
+         pred_nz(slot) = nz
+         pred_nvar(slot) = nvar
+         pred_dt(slot) = s% dt
+      end subroutine pred_record
+
+
+      subroutine pred_apply(s, nvar)
+         ! set the solver's initial dx by extrapolating rates from previous steps
+         use star_solver, only: solver_pred_applied
+         type (star_info), pointer :: s
+         integer, intent(in) :: nvar
+         integer :: a, b, k, i, j2, nv
+         real(dp) :: dt, q, ra, rb, acc, dx, x_new
+         logical :: is_face
+         call pred_init()
+         solver_pred_applied = 0
+         if (pred_mode <= 0 .or. .not. allocated(pred_rate)) return
+         a = findloc(pred_model, s% model_number - 1, dim=1)
+         if (a == 0) return
+         b = 0
+         if (pred_mode >= 2) b = findloc(pred_model, s% model_number - 2, dim=1)
+         if (pred_nvar(a) == nvar) then
+            nv = nvar
+         else  ! network changed size: only predict structure variables
+            nv = min(s% nvar_hydro, pred_nvar(a))
+         end if
+         if (b > 0) then
+            if (pred_nvar(b) /= pred_nvar(a)) b = 0
+         end if
+         dt = s% dt
+         do k = 1, s% nz
+            do i = 1, nv
+               is_face = (i == s% i_lnR .or. i == s% i_lum .or. i == s% i_v)
+               if (is_face) then
+                  q = s% q(k)
+               else
+                  q = s% q(k) - 0.5d0*s% dq(k)
+               end if
+               ra = pred_rate_at(i, a, q, is_face)
+               if (b > 0) then
+                  rb = pred_rate_at(i, b, q, is_face)
+                  acc = (ra - rb)/(0.5d0*(pred_dt(a) + pred_dt(b)))
+                  dx = dt*(ra + 0.5d0*acc*(pred_dt(a) + dt))
+               else
+                  dx = dt*ra
+               end if
+               if (i > s% nvar_hydro) then
+                  j2 = i - s% nvar_hydro
+                  x_new = min(1d0, max(0d0, s% xa_start(j2,k) + dx))
+                  dx = x_new - s% xa_start(j2,k)
+                  s% xa_sub_xa_start(j2,k) = dx
+               end if
+               s% solver_dx(i,k) = dx
+            end do
+         end do
+         if (b > 0) then
+            solver_pred_applied = 2
+         else
+            solver_pred_applied = 1
+         end if
+      end subroutine pred_apply
 
 
       subroutine save_start_values(s, ierr)
@@ -569,6 +730,8 @@
             end do
          end if
 
+         call pred_apply(s, nvar)  ! savethesun predictor
+
          converged = .false.
          call hydro_solver_step( &
             s, nz, s% nvar_hydro, nvar, skip_global_corr_coeff_limit, &
@@ -612,6 +775,8 @@
             end if
             return
          end if
+
+         call pred_record(s, nvar)  ! savethesun predictor
 
       end function do_solver
 

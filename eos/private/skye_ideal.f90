@@ -30,6 +30,7 @@ module skye_ideal
    public :: compute_F_ideal_ion
    public :: compute_xne
    public :: compute_ideal_ele
+   public :: compute_dF_ideal_ion_dya  ! savethesun skye dxa
 
    real(dp), parameter :: sifac  = planck_h * planck_h * planck_h / (2d0 * pi * amu * sqrt(2d0 * pi * amu))
 
@@ -69,6 +70,27 @@ module skye_ideal
       F_ideal_ion = F_ideal_ion * kt / (amu * abar)
 
    end function compute_F_ideal_ion
+
+   ! savethesun skye dxa: d F_ideal_ion / d ya(j) at fixed abar (erg/g per unit number fraction)
+   subroutine compute_dF_ideal_ion_dya(temp, den, abar, species, weights, ya, dF)
+      type(auto_diff_real_2var_order3), intent(in) :: temp, den
+      integer, intent(in) :: species
+      real(dp), intent(in) :: weights(species), ya(species), abar
+      type(auto_diff_real_2var_order3), intent(out) :: dF(species)
+
+      integer :: j
+      type(auto_diff_real_2var_order3) :: n, nQ, kt, lnq, pref
+
+      kt = kerg * temp
+      n = den / (amu * abar)
+      nQ = pow(kT, 1.5d0) / sifac
+      lnq = log(n / nQ)
+      pref = kt / (amu * abar)
+      do j=1,species
+         ! d/dy [y (ln(y n/nQ_j) - 1)] = ln(y n/nQ_j), nQ_j = nQ weights_j^1.5
+         dF(j) = (lnq + (log(ya(j)) - 1.5d0*log(weights(j)))) * pref
+      end do
+   end subroutine compute_dF_ideal_ion_dya
 
    type(auto_diff_real_2var_order3) function compute_xne(den, ytot1, zbar) result(xne)
       type(auto_diff_real_2var_order3), intent(in) :: den

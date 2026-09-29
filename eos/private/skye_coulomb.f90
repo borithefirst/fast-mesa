@@ -58,12 +58,16 @@ module skye_coulomb
    !! @param latent_ddlnRho The latent heat of the smoothed phase transition in lnRho (T dS/dlnRho)
    subroutine nonideal_corrections(NMIX,AY,AZion,ACMI, min_gamma_for_solid, max_gamma_for_liquid,&
                                    Skye_solid_mixing_rule, RHO,temp, xnefer, abar, &
-                                   dF, latent_ddlnT, latent_ddlnRho,phase)
+                                   dF, latent_ddlnT, latent_ddlnRho,phase, dF_dAY)
       integer, intent(in) :: NMIX
       real(dp), intent(in) :: AZion(:), ACMI(:), abar, AY(:), min_gamma_for_solid, max_gamma_for_liquid
       type(auto_diff_real_2var_order3), intent(in) :: RHO, temp, xnefer
       type(auto_diff_real_2var_order3), intent(out) :: dF, phase, latent_ddlnT, latent_ddlnRho
       character(len=128), intent(in) :: Skye_solid_mixing_rule
+      ! savethesun skye dxa: optional d dF / d AY(i) (erg/g) of the selected phase at fixed RS, GAME, temp, abar
+      type(auto_diff_real_2var_order3), intent(out), optional :: dF_dAY(:)
+      type(auto_diff_real_2var_order3) :: dliq(NMIX), dsol(NMIX), exc
+      logical :: use_liq, use_sol
 
       integer :: IX
       integer :: LIQSOL
@@ -90,7 +94,8 @@ module skye_coulomb
       GAME = qe * qe / (rbohr * boltzm * temp * RS)  ! electron Coulomb parameter Gamma_e
 
       ! Electron exchange-correlation free energy
-      F_phase_independent = Zmean * EXCOR7(RS,GAME)
+      exc = EXCOR7(RS,GAME)
+      F_phase_independent = Zmean * exc
 
       ! Linear mixing entropy
       Smix = linear_mixing_entropy(NMIX, Azion, AY)
@@ -103,6 +108,15 @@ module skye_coulomb
 
 
       ! Compute free energy correction for liquid and solid phase.
+      if (present(dF_dAY)) then  ! savethesun skye dxa: also collect the per-species OCP terms f_i of both phases
+         LIQSOL = 0
+         dF_liq = nonideal_corrections_phase(NMIX,AY,AZion,ACMI,min_gamma_for_solid, max_gamma_for_liquid,&
+             Skye_solid_mixing_rule, temp,abar,GAME,RS,LIQSOL,Zmean, Z2mean, Z52, Z53, Z321, dliq)
+         LIQSOL = 1
+         dF_sol = nonideal_corrections_phase(NMIX,AY,AZion,ACMI,min_gamma_for_solid, max_gamma_for_liquid,&
+             Skye_solid_mixing_rule, temp,abar,GAME,RS,LIQSOL,Zmean, Z2mean, Z52, Z53, Z321, dsol)
+      else
+
       LIQSOL = 0
       dF_liq = nonideal_corrections_phase(NMIX,AY,AZion,ACMI,min_gamma_for_solid, max_gamma_for_liquid,&
           Skye_solid_mixing_rule, temp,abar,GAME,RS,LIQSOL,Zmean, Z2mean, Z52, Z53, Z321)
@@ -110,6 +124,8 @@ module skye_coulomb
       LIQSOL = 1
       dF_sol = nonideal_corrections_phase(NMIX,AY,AZion,ACMI,min_gamma_for_solid, max_gamma_for_liquid,&
           Skye_solid_mixing_rule, temp,abar,GAME,RS,LIQSOL,Zmean, Z2mean, Z52, Z53, Z321)
+
+      end if
 
       ! Add electron exchange-correlation energy
       dF_liq = dF_liq + F_phase_independent
@@ -123,11 +139,200 @@ module skye_coulomb
       ! Produce a smoothed version of the phase transition to extract the latent heat
       call decide_phase(dF_liq, dF_sol, kT, temp, rho, dF, phase, latent_ddlnT, latent_ddlnRho)
 
+      if (present(dF_dAY)) then  ! savethesun skye dxa: dF = min(dF_liq, dF_sol); mixing-rule terms of that phase only
+         use_liq = (dF_liq%val <= dF_sol%val)
+         use_sol = (dF_sol%val <= dF_liq%val)
+         if (use_liq) call liquid_mixing_rule_dAY(NMIX, AZion, RS, GAME, Zmean, Z2mean, Z52, Z53, Z321, dliq)
+         if (use_sol) call solid_mixing_rule_dAY(Skye_solid_mixing_rule, NMIX, AY, AZion, GAME, dsol)
+         do IX=1,NMIX
+            if (use_liq .and. use_sol) then
+               dF_dAY(IX) = 0.5d0 * (dliq(IX) + dsol(IX))
+            else if (use_liq) then
+               dF_dAY(IX) = dliq(IX)
+            else
+               dF_dAY(IX) = dsol(IX)
+            end if
+            ! phase-independent part: Zmean*EXCOR7 - Smix, with Smix = -sum AY ln AY
+            if (AY(IX) /= 1d0) then
+               dF_dAY(IX) = dF_dAY(IX) + AZion(IX)*exc + (log(AY(IX)) + 1d0)
+            else
+               dF_dAY(IX) = dF_dAY(IX) + AZion(IX)*exc + 1d0
+            end if
+            dF_dAY(IX) = dF_dAY(IX) * kT
+         end do
+      end if
+
       if (dbg) then
          write(*,*) 'GAME',GAME%val,'Phase', phase%val
       end if
 
    end subroutine nonideal_corrections
+
+   ! savethesun skye dxa: d FMIX_liquid / d AY(i) (per ion per kT) at fixed RS, GAME, added to dF(i).
+   ! FMIX depends on AY only through the charge moments M = (Zmean, Z2mean, Z52, Z53, Z321), each linear
+   ! in AY; this is the analytic derivative of liquid_mixing_rule_correction (same branches). As in
+   ! Skye, FMIX = 0 for a one-component plasma; within |D - 1| < 1e-5 of it the expression is 0/0-like
+   ! and the correction itself O(D - 1) small, so no derivative is added there.
+   subroutine liquid_mixing_rule_dAY(NMIX, AZion, RS, GAME, Zmean, Z2mean, Z52, Z53, Z321, dF)
+      integer, intent(in) :: NMIX
+      real(dp), intent(in) :: AZion(:), Zmean, Z2mean, Z52, Z53, Z321
+      type(auto_diff_real_2var_order3), intent(in) :: RS, GAME
+      type(auto_diff_real_2var_order3), intent(inout) :: dF(:)
+
+      integer :: i
+      logical :: ocp
+      real(dp) :: D, s, Dif0, DifR, P3, omP3, N0, D0, Q, R, Zi, m1, m2, m52, m53, m321
+      real(dp) :: dD, ds, dDif0, dDifR, dP3, dN0, dD0, dQ, dR, dlng
+      type(auto_diff_real_2var_order3) :: lng, W, GP, G15, GQ, lnGQ, damp, FMIX, B
+      type(auto_diff_real_2var_order3) :: a_Dif0, a_D0, a_P3, a_lng, a_Q, a_R
+      real(dp), parameter :: TINY = 1d-9
+
+      if (Zmean == 0d0) return
+      D = Z2mean/(Zmean*Zmean)
+      if (abs(D - 1d0) < 1d-5) return
+      ocp = (RS%val < TINY)
+      if (ocp) then
+         s = sqrt(Z2mean*Z2mean*Z2mean/Zmean)
+         Dif0 = Z52 - s
+      else
+         s = sqrt((Z2mean+Zmean)*(Z2mean+Zmean)*(Z2mean+Zmean)/Zmean)
+         Dif0 = Z321 - s
+      end if
+      DifR = Dif0/Z52
+      P3 = pow(D, -0.2d0)
+      omP3 = 1d0 - P3
+      N0 = 2.6d0*DifR + 14d0*DifR*DifR*DifR
+      D0 = N0/omP3
+      Q = D*D*0.0117d0
+      R = 1.5d0/P3 - 1d0
+
+      ! FMIX = Dif0 GAME^1.5/sqrt(3) / (1 + GP) / (1 + GQ)^R,  GP = D0 (GAME Z53)^P3,  GQ = Q GP
+      lng = log(GAME*Z53)
+      W = exp(P3*lng)
+      GP = D0*W
+      G15 = GAME*sqrt(GAME/3d0)
+      GQ = Q*GP
+      lnGQ = log(1d0 + GQ)
+      damp = exp(-R*lnGQ)
+      FMIX = Dif0*G15/(1d0 + GP)*damp
+
+      ! dFMIX = a_Dif0 dDif0 + a_D0 dD0 + a_P3 dP3 + a_lng dln(Z53) + a_Q dQ + a_R dR
+      B = -FMIX/(1d0 + GP) - FMIX*R*Q/(1d0 + GQ)  ! coefficient of dGP
+      a_Dif0 = G15/(1d0 + GP)*damp
+      a_D0 = B*W
+      a_P3 = B*D0*W*lng
+      a_lng = B*D0*W*P3
+      a_Q = -FMIX*R/(1d0 + GQ)*GP
+      a_R = -FMIX*lnGQ
+
+      do i=1,NMIX
+         Zi = AZion(i)
+         ! d(moment)/d AY(i)
+         m1 = Zi
+         m2 = Zi*Zi
+         m52 = pow5(sqrt(Zi))
+         m53 = Zi**(5d0/3d0)
+         m321 = Zi*pow3(sqrt(Zi + 1d0))
+         dD = m2/(Zmean*Zmean) - 2d0*Z2mean*m1/(Zmean*Zmean*Zmean)
+         if (ocp) then
+            ds = 0.5d0*s*(3d0*m2/Z2mean - m1/Zmean)
+            dDif0 = m52 - ds
+         else
+            ds = 0.5d0*s*(3d0*(m2 + m1)/(Z2mean + Zmean) - m1/Zmean)
+            dDif0 = m321 - ds
+         end if
+         dDifR = dDif0/Z52 - Dif0*m52/(Z52*Z52)
+         dP3 = -0.2d0*P3/D*dD
+         dN0 = (2.6d0 + 42d0*DifR*DifR)*dDifR
+         dD0 = (dN0*omP3 + N0*dP3)/(omP3*omP3)
+         dQ = 0.0234d0*D*dD
+         dR = -1.5d0/(P3*P3)*dP3
+         dlng = m53/Z53
+         dF(i) = dF(i) + a_Dif0*dDif0 + a_D0*dD0 + a_P3*dP3 + a_lng*dlng + a_Q*dQ + a_R*dR
+      end do
+   end subroutine liquid_mixing_rule_dAY
+
+   ! savethesun skye dxa: deltaG_PC13 and its derivative in x2
+   subroutine deltaG_PC13_and_deriv(x2, Rz, dG, dGp)
+      real(dp), intent(in) :: x2, Rz
+      real(dp), intent(out) :: dG, dGp
+      real(dp) :: xR, x, xp, K, R53, L, hx, h2
+
+      xR = x2**Rz
+      x = x2/Rz + (1d0 - 1d0/Rz)*xR
+      xp = 1d0/Rz + (Rz - 1d0)*xR/x2
+      K = 0.012d0*(1d0 - 1d0/(Rz*Rz))
+      R53 = Rz**(5d0/3d0)
+      L = 1d0 - x2 + x2*R53
+      hx = x*(1d0 - x)
+      h2 = x2*(1d0 - x2)
+      dG = K*hx/h2*L
+      dGp = K*(((1d0 - 2d0*x)*xp*h2 - hx*(1d0 - 2d0*x2))/(h2*h2)*L + hx/h2*(R53 - 1d0))
+   end subroutine deltaG_PC13_and_deriv
+
+   ! savethesun skye dxa: d FMIX_solid / d AY(i) (per ion per kT) at fixed GAME, added to dF(i).
+   ! FMIX = GAME S(AY), S = sum over charge-group pairs (a, b), Z_b > Z_a, of Z_a^(5/3) c_a c_b dG(x, Z_b/Z_a),
+   ! x = c_b/(c_a + c_b), c = summed AY of the group (as in solid_mixing_rule_correction; equal-charge
+   ! pairs have dG = 0). Analytic for 'PC', dG'(x) by central differences for 'Ogata'.
+   subroutine solid_mixing_rule_dAY(Skye_solid_mixing_rule, n, AY, AZion, GAME, dF)
+      character(len=128), intent(in) :: Skye_solid_mixing_rule
+      integer, intent(in) :: n
+      real(dp), intent(in) :: AY(:), AZion(:)
+      type(auto_diff_real_2var_order3), intent(in) :: GAME
+      type(auto_diff_real_2var_order3), intent(inout) :: dF(:)
+
+      integer :: i, j, nu, iu(n)
+      logical :: pc, found
+      real(dp) :: uz(n), uc(n), dS(n), RZ, sab, xb, dG, dGp, w, h
+      real(dp), parameter :: eps = 1d-40
+
+      pc = (Skye_solid_mixing_rule == 'PC')
+      if (.not. pc .and. Skye_solid_mixing_rule /= 'Ogata') return  ! Skye stops on an invalid rule anyway
+      nu = 0
+      do i=1,n
+         found = .false.
+         do j=1,nu
+            if (uz(j) == AZion(i)) then
+               found = .true.
+               iu(i) = j
+               uc(j) = uc(j) + AY(i)
+               exit
+            end if
+         end do
+         if (.not. found) then
+            nu = nu + 1
+            uz(nu) = AZion(i)
+            uc(nu) = AY(i)
+            iu(i) = nu
+         end if
+      end do
+
+      dS(1:nu) = 0d0
+      do i=1,nu
+         if (uz(i) == 0d0) cycle
+         w = uz(i)**(5d0/3d0)
+         do j=1,nu
+            if (j == i .or. uz(j) == 0d0 .or. uz(j) < uz(i)) cycle
+            RZ = uz(j)/uz(i)
+            sab = uc(i) + uc(j)
+            if (sab <= eps) cycle
+            xb = uc(j)/sab
+            if (pc) then
+               call deltaG_PC13_and_deriv(xb, RZ, dG, dGp)
+            else
+               dG = deltaG_Ogata93(xb, RZ)
+               h = 1d-6*min(xb, 1d0 - xb)
+               dGp = (deltaG_Ogata93(xb + h, RZ) - deltaG_Ogata93(xb - h, RZ))/(2d0*h)
+            end if
+            ! term w c_i c_j dG(x):  dx/dc_i = -c_j/sab^2,  dx/dc_j = c_i/sab^2
+            dS(i) = dS(i) + w*(uc(j)*dG - uc(i)*uc(j)*dGp*uc(j)/(sab*sab))
+            dS(j) = dS(j) + w*(uc(i)*dG + uc(i)*uc(j)*dGp*uc(i)/(sab*sab))
+         end do
+      end do
+      do i=1,n
+         dF(i) = dF(i) + GAME*dS(iu(i))
+      end do
+   end subroutine solid_mixing_rule_dAY
 
 
    !> Computes the free energy, phase, and latent heat across the phase transition
@@ -220,7 +425,7 @@ module skye_coulomb
    !! @param Z53mean The mean of ion charge to the 5/3 power (mass fraction weighted)
    !! @param Z321mean The mean of Z(Z+1)^(3/2), where Z is the ion charge (mass fraction weighted)
    function nonideal_corrections_phase(NMIX,AY,AZion,ACMI,min_gamma_for_solid, max_gamma_for_liquid,Skye_solid_mixing_rule,&
-                                       temp,abar,GAME,RS,LIQSOL,Zmean, Z2mean, Z52, Z53, Z321) result(dF)
+                                       temp,abar,GAME,RS,LIQSOL,Zmean, Z2mean, Z52, Z53, Z321, dF_dAY) result(dF)
       ! Inputs
       integer, intent(in) :: NMIX
       integer, intent(in) :: LIQSOL
@@ -228,6 +433,9 @@ module skye_coulomb
                               min_gamma_for_solid, max_gamma_for_liquid
       type(auto_diff_real_2var_order3), intent(in) :: temp, GAME, RS
       character(len=128), intent(in) :: Skye_solid_mixing_rule
+      ! savethesun skye dxa: optional per-species OCP terms f_i = d(sum AY f)/d AY(i) at fixed RS, GAME
+      ! (the mixing-rule derivatives are added by nonideal_corrections for the selected phase only)
+      type(auto_diff_real_2var_order3), intent(out), optional :: dF_dAY(:)
 
       ! Intermediates and constants
       integer :: i
@@ -251,7 +459,10 @@ module skye_coulomb
                f = f + ocp_solid_screening_free_energy_correction(AZion(i), ACMI(i), GAME, RS)  ! screening corrections
             end if
             dF = dF + AY(i) * f
+            if (present(dF_dAY)) dF_dAY(i) = f  ! savethesun skye dxa
 
+         else if (present(dF_dAY)) then
+            dF_dAY(i) = 0d0
          end if
       end do
 

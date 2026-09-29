@@ -31,7 +31,26 @@ module skye
       private
       public :: Get_Skye_EOS_Results, Get_Skye_alfa, Get_Skye_alfa_simple, get_Skye_for_eosdt
 
+      ! savethesun skye dxa: analytic composition partials, opt-in via MESA_SKYE_DXA=1
+      logical, save :: skye_dxa_checked = .false., skye_dxa_on = .false.
+
       contains
+
+      logical function skye_dxa_enabled()
+         character(len=16) :: v
+         integer :: st
+         if (.not. skye_dxa_checked) then
+!$OMP critical (skye_dxa_init)
+            if (.not. skye_dxa_checked) then
+               call get_environment_variable('MESA_SKYE_DXA', v, status=st)
+               skye_dxa_on = (st == 0 .and. len_trim(v) > 0 .and. trim(v) /= '0')
+!$OMP flush
+               skye_dxa_checked = .true.
+            end if
+!$OMP end critical (skye_dxa_init)
+         end if
+         skye_dxa_enabled = skye_dxa_on
+      end function skye_dxa_enabled
 
       subroutine Get_Skye_alfa( &
             rq, logRho, logT, Z, abar, zbar, &
@@ -219,21 +238,24 @@ module skye
          real(dp), intent(out), dimension(nv, species) :: d_dxa
 
          real(dp) :: logT_ion, logT_neutral
+         logical :: do_dxa  ! savethesun skye dxa
 
          include 'formats'
 
          ierr = 0
 
+         do_dxa = eos_want_skye_dxa
+         if (do_dxa) do_dxa = skye_dxa_enabled()
          call skye_eos( &
             T, Rho, X, abar, zbar, &
             rq%Skye_min_gamma_for_solid, rq%Skye_max_gamma_for_liquid, &
             rq%Skye_solid_mixing_rule, rq%mass_fraction_limit_for_Skye, &
             rq%Skye_use_ion_offsets, &
             species, chem_id, xa, &
-            res, d_dlnd, d_dlnT, d_dxa, ierr)
+            res, d_dlnd, d_dlnT, d_dxa, ierr, do_dxa)
 
-         ! composition derivatives not provided
-         d_dxa = 0
+         ! composition derivatives not provided  ! savethesun skye dxa: unless MESA_SKYE_DXA=1
+         if (.not. do_dxa) d_dxa = 0
 
          if (ierr /= 0) then
             if (dbg) then
@@ -279,9 +301,11 @@ module skye
             Skye_solid_mixing_rule, &
             mass_fraction_limit, use_ion_offsets, &
             species, chem_id, xa, &
-            res, d_dlnd, d_dlnT, d_dxa, ierr)
+            res, d_dlnd, d_dlnT, d_dxa, ierr, do_dxa)
 
          use eos_def
+         use chem_lib, only: composition_info  ! savethesun skye dxa
+         use const_def, only: amu
          use utils_lib, only: is_bad
          use chem_def, only: chem_isos
          use ion_offset, only: compute_ion_offset
@@ -311,7 +335,21 @@ module skye
          type(auto_diff_real_2var_order3) :: F_ion_gas, F_rad, F_ideal_ion, F_coul
          type(auto_diff_real_2var_order3) :: F_ele
 
+         ! savethesun skye dxa
+         logical, intent(in), optional :: do_dxa
+         logical :: want_dxa
+         integer :: m
+         type(auto_diff_real_2var_order3) :: F_ii0, Kfac, dF_dabar, dF_dzbar, dF_dye, Fybar, G
+         type(auto_diff_real_2var_order3) :: dFc_dAY(species), dFii_dya(species), Fy(species)
+         real(dp) :: xh_ci, xhe_ci, zz_ci, abar_ci, zbar_ci, z2bar_ci, z53bar_ci, ye_ci, mc_ci, sumx_ci
+         real(dp), dimension(species) :: dabar_dx, dzbar_dx, dmc_dx, xpure
+         real(dp) :: Srel, norm_all, sumya, F_off, e_tot, pgas_tot
+
          ht => eos_ht
+
+         want_dxa = .false.
+         if (present(do_dxa)) want_dxa = do_dxa
+         if (want_dxa) d_dxa = 0
 
          ierr = 0
 
@@ -368,6 +406,7 @@ module skye
 
          ! Ideal ion free energy, only depends on abar
          F_ideal_ion = compute_F_ideal_ion(temp, den, abar, relevant_species, ACMI, ya)
+         F_ii0 = F_ideal_ion
 
          if (use_ion_offsets) then
             F_ideal_ion = F_ideal_ion + compute_ion_offset(species, xa, chem_id)  ! Offset so ion ground state energy is zero.
@@ -386,15 +425,86 @@ module skye
          end do
 
          ! Compute non-ideal corrections
+         if (want_dxa) then  ! savethesun skye dxa
+         call nonideal_corrections(relevant_species, ya(1:relevant_species), &
+                                     AZION(1:relevant_species), ACMI(1:relevant_species), &
+                                     Skye_min_gamma_for_solid, Skye_max_gamma_for_liquid, &
+                                     Skye_solid_mixing_rule, den, temp, xnefer, abar, &
+                                     F_coul, latent_ddlnT, latent_ddlnRho, phase, &
+                                     dF_dAY=dFc_dAY(1:relevant_species))
+         else
          call nonideal_corrections(relevant_species, ya(1:relevant_species), &
                                      AZION(1:relevant_species), ACMI(1:relevant_species), &
                                      Skye_min_gamma_for_solid, Skye_max_gamma_for_liquid, &
                                      Skye_solid_mixing_rule, den, temp, xnefer, abar, &
                                      F_coul, latent_ddlnT, latent_ddlnRho, phase)
+         end if
 
          call  pack_for_export(F_ideal_ion, F_coul, F_rad, F_ele, temp, den, xnefer, etaele, abar, zbar, &
                                  phase, latent_ddlnT, latent_ddlnRho, res, d_dlnd, d_dlnT, ierr)
          if(ierr/=0) return
+
+         if (.not. want_dxa) return
+
+         ! savethesun skye dxa: G_j = dF/dxa_j as a function of (T, rho); then
+         ! d lnE/dxa_j = (G - T dG/dT)/E and d lnPgas/dxa_j = rho^2 (dG/drho)/Pgas.
+         call composition_info( &
+            species, chem_id, xa, xh_ci, xhe_ci, zz_ci, &
+            abar_ci, zbar_ci, z2bar_ci, z53bar_ci, ye_ci, mc_ci, &
+            sumx_ci, dabar_dx, dzbar_dx, dmc_dx)
+
+         Kfac = kerg * temp / (amu * abar)
+         call compute_dF_ideal_ion_dya(temp, den, abar, relevant_species, ACMI, ya, dFii_dya)
+         sumya = 0d0
+         do m=1,relevant_species
+            sumya = sumya + ya(m)
+         end do
+
+         ! at fixed ye and ya: ideal ions (F_ii0 excludes the offset) and the Coulomb prefactor kT/(abar amu)
+         dF_dabar = -(F_ii0 + Kfac*sumya)/abar - F_coul/abar
+         ! electrons: F_ele = ye f(T, ye rho); Coulomb depends on ye only through n_e = ye rho N_A
+         dF_dye = (F_ele + den*differentiate_2(F_ele))/ye + den*differentiate_2(F_coul)/ye
+         dF_dabar = dF_dabar - dF_dye*ye/abar
+         dF_dzbar = dF_dye/abar
+
+         Fybar = 0d0
+         do m=1,relevant_species
+            Fy(m) = dFii_dya(m) + dFc_dAY(m)
+            Fybar = Fybar + ya(m)*Fy(m)
+         end do
+
+         ! ya_m = (xa_m/A_m)/Srel over relevant species: d ya_i/d xa_m = (delta_im - ya_i)/(A_m Srel)
+         Srel = 0d0
+         norm_all = 0d0
+         do j=1,species
+            norm_all = norm_all + xa(j)/chem_isos% Z_plus_N(chem_id(j))
+            if (xa(j) > mass_fraction_limit) Srel = Srel + xa(j)/chem_isos% Z_plus_N(chem_id(j))
+         end do
+         F_off = 0d0
+         if (use_ion_offsets) F_off = compute_ion_offset(species, xa, chem_id)
+
+         e_tot = exp(res(i_lnE))
+         pgas_tot = exp(res(i_lnPgas))
+         m = 0
+         do j=1,species
+            ! chem_lib: abar = sumx/sum(y), zbar = sum(y Z)*abar, i.e. both carry the sumx factor. Its dabar_dx
+            ! includes that factor, its dzbar_dx does not (d of the mean charge); add it back (+ zbar/sumx)
+            ! so G is the derivative of the function as evaluated (what finite differences see).
+            G = dF_dabar*dabar_dx(j) + dF_dzbar*(dzbar_dx(j) + zbar_ci/sumx_ci)
+            if (xa(j) > mass_fraction_limit) then
+               m = m + 1
+               G = G + (Fy(m) - Fybar)/(A(m)*Srel)
+            end if
+            if (use_ion_offsets) then
+               ! offset = C sum_k I_k y_k / sum_k y_k, y = xa/A: d/dxa_j = (C I_j - offset)/(A_j sum y)
+               xpure = 0d0
+               xpure(j) = 1d0
+               G = G + (compute_ion_offset(species, xpure, chem_id) - F_off) / &
+                  (chem_isos% Z_plus_N(chem_id(j))*norm_all)
+            end if
+            d_dxa(i_lnE,j) = (G%val - temp%val*G%d1val1)/e_tot
+            d_dxa(i_lnPgas,j) = den%val*den%val*G%d1val2/pgas_tot
+         end do
 
       end subroutine skye_eos
 

@@ -85,6 +85,11 @@
 
 
       logical, parameter :: show_allocations = .false.  ! for debugging memory usage
+
+      ! savethesun skye dxa: raised by the caller (star's do_eos_for_cell) around the EOS calls whose d_dxa it keeps;
+      ! Skye computes its analytic d_dxa only then (and only with MESA_SKYE_DXA=1). Per thread.
+      logical :: eos_want_skye_dxa = .false.
+!$OMP threadprivate(eos_want_skye_dxa)
       integer, parameter :: eos_name_length = 20  ! String length for storing EOS variable names
 
 

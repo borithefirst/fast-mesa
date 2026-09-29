@@ -68,9 +68,13 @@ __attribute__((constructor)) static void fastcr_init(void) {
   if (!real_log_rz || !real_exp_rd) { real_log_rz = real_exp_rd = missing; return; }
   const char *e = getenv("MESA_FAST_CRLIBM");
   if (e && e[0] == '0') return;
-  if (!HAVE_FMA_CPU()) { printf(" savethesun: MESA_FAST_CRLIBM ignored (CPU has no FMA)\n"); fflush(stdout); return; }
+  /* silent when on by default: MESA's tests diff program output (math/test/ck keys on its first line) */
+  if (!HAVE_FMA_CPU()) {
+    if (e) { printf(" savethesun: MESA_FAST_CRLIBM ignored (CPU has no FMA)\n"); fflush(stdout); }
+    return;
+  }
   fastcr_on = 1;
-  printf(" savethesun: fast correctly-rounded exp/log front end (crlibm fallback)\n"); fflush(stdout);
+  if (e) { printf(" savethesun: fast correctly-rounded exp/log front end (crlibm fallback)\n"); fflush(stdout); }
 }
 #define FB_LOG(x) return real_log_rz(x)
 #define FB_EXP(x) return real_exp_rd(x)

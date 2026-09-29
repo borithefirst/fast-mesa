@@ -38,6 +38,11 @@ Modules for Experiments in Stellar Astrophysics (MESA)
 
 |
 
+   **fast-mesa**: this is a modified version of MESA r25.12.1 (branch ``fast-mesa``, changes since
+   2026-09-29). It is not an official MESA release and is not endorsed by the MESA developers. It makes the
+   same calculations about 2× faster; see `FAST-MESA.md <FAST-MESA.md>`__ for what changed and how accuracy was
+   checked. The text below is MESA's own README.
+
    **WARNING**: The default ``main`` branch is the development version of
    MESA and is not guaranteed to function correctly.  If you are using
    MESA, you should use an `official release version <https://zenodo.org/records/13353788>`__.

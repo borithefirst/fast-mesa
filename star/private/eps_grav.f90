@@ -27,8 +27,14 @@
 
       implicit none
 
+      ! savethesun epsg lin: check-mode accumulators
+      logical, save :: epsg_lin_check = .false.
+      integer, save :: epsg_chk_model = -1, epsg_chk_n = 0
+      real(dp), save :: epsg_chk_err = 0d0, epsg_chk_mag = 0d0
+
       private
       public :: eval_eps_grav_and_partials, zero_eps_grav_and_partials
+      public :: epsg_lin_report  ! savethesun epsg lin
 
       contains
 
@@ -259,15 +265,54 @@
       end subroutine do_lnS_eps_grav
 
 
+      real(dp) function epsg_lin_threshold()  ! savethesun epsg lin: env MESA_EPSG_LIN=<max |dX|>, 0 = off
+         logical, save :: checked = .false.
+         real(dp), save :: thr = 0d0
+         character(len=64) :: val
+         integer :: stat
+         if (.not. checked) then
+            !$OMP CRITICAL (savethesun_epsg_lin)
+            if (.not. checked) then
+               call get_environment_variable('MESA_EPSG_LIN', val, status=stat)
+               if (stat == 0 .and. len_trim(val) > 0) then
+                  read(val, *, iostat=stat) thr
+                  if (stat /= 0 .or. thr < 0d0) thr = 0d0
+               end if
+               call get_environment_variable('MESA_EPSG_LIN_CHECK', val, status=stat)
+               epsg_lin_check = (stat == 0 .and. len_trim(val) > 0 .and. trim(val) /= '0')
+               if (thr > 0d0) write(*,'(a,es10.2,a,l2)') &
+                  'savethesun: linearized eps_grav composition term for 0 < |dX| <', thr, '  check', epsg_lin_check
+               checked = .true.
+            end if
+            !$OMP END CRITICAL (savethesun_epsg_lin)
+         end if
+         epsg_lin_threshold = thr
+      end function epsg_lin_threshold
+
+
+      subroutine epsg_lin_report(s)  ! savethesun epsg lin: check mode, once per model (called from serial code)
+         type (star_info), pointer :: s
+         if (.not. epsg_lin_check) return
+         if (s% model_number == epsg_chk_model) return
+         if (epsg_chk_model >= 0) write(*,'(a,i8,i10,2es12.3)') 'EPSGLIN ', epsg_chk_model, &
+            epsg_chk_n, epsg_chk_err, epsg_chk_mag
+         epsg_chk_model = s% model_number
+         epsg_chk_n = 0; epsg_chk_err = 0d0; epsg_chk_mag = 0d0
+      end subroutine epsg_lin_report
+
+
       subroutine eval_eps_grav_composition(s, k, eps_grav_composition_term, ierr)
          use auto_diff_support, only: wrap
          use eos_support, only: get_eos, get_eos_memo, eos_memo_count, eos_memo_stats_on  ! savethesun eos memo
+         use eos_support, only: eos_skye_dxa_on  ! savethesun epsg lin
          use eos_def, only: num_eos_basic_results, num_eos_d_dxa_results, i_lnE, i_lnPgas
 
          type (star_info), pointer :: s
          integer, intent(in) :: k
          type(auto_diff_real_star_order1), intent(out) :: eps_grav_composition_term
          real(dp) :: memo_mx  ! savethesun eos memo
+         real(dp) :: lin_thr, lin_mx, lin_S, lin_de, lin_dd, lin_dT  ! savethesun epsg lin
+         logical :: lin_ok
          integer, intent(out) :: ierr
          real(dp) :: &
             e, e_start, de, d_de_dlnd, d_de_dlnT, &
@@ -304,6 +349,31 @@
             s% d_eps_grav_dx(j,k) = -s% energy(k) * s% dlnE_dxa_for_partials(j,k)/s% dt + &
                (s% Peos(k) / s% Rho(k)) * s% dlnPeos_dxa_for_partials(j,k) * s% dxh_lnd(k)/s% dt
          end do
+
+         ! savethesun epsg lin: first-order expansion for tiny composition changes
+         lin_ok = .false.
+         lin_thr = epsg_lin_threshold()
+         if (lin_thr > 0d0) then
+            if (s% eos_frac_PC(k) + s% eos_frac_ideal(k) == 0d0 .and. &
+                (s% eos_frac_Skye(k) == 0d0 .or. eos_skye_dxa_on)) then
+               lin_mx = maxval(abs(s% xa(:,k) - s% xa_start(:,k)))
+               lin_ok = (lin_mx > 0d0 .and. lin_mx < lin_thr)
+            end if
+         end if
+         if (lin_ok) then
+            lin_S = sum(s% dlnE_dxa_for_partials(:,k)*(s% xa(:,k) - s% xa_start(:,k)))
+            if (s% use_time_centered_eps_grav .and. .not. s% doing_relax) then
+               lin_de = theta*s% energy(k)*lin_S + (1d0 - theta)*s% energy_start(k)*lin_S
+            else
+               lin_de = s% energy(k)*lin_S
+            end if
+            lin_dd = theta*lin_S*s% dE_dRho_for_partials(k)*s% Rho(k)
+            lin_dT = theta*lin_S*s% Cv_for_partials(k)*s% T(k)
+            if (.not. epsg_lin_check) then
+               de = lin_de; d_de_dlnd = lin_dd; d_de_dlnT = lin_dT
+               goto 777
+            end if
+         end if
 
          e = s% energy(k)
          call get_eos_memo( &  ! savethesun eos memo
@@ -376,6 +446,14 @@
 
          end if
 
+         if (lin_ok .and. epsg_lin_check) then  ! savethesun epsg lin: compare with the stock value (which is kept)
+            !$OMP CRITICAL (savethesun_epsg_chk)
+            epsg_chk_n = epsg_chk_n + 1
+            epsg_chk_err = max(epsg_chk_err, abs(lin_de - de)/s% energy(k))
+            epsg_chk_mag = max(epsg_chk_mag, abs(de)/s% energy(k))
+            !$OMP END CRITICAL (savethesun_epsg_chk)
+         end if
+777      continue  ! savethesun epsg lin
          call wrap(eps_grav_composition_term, -de/s% dt, &
             0d0, -d_de_dlnd/s% dt, 0d0, &
             0d0, -d_de_dlnT/s% dt, 0d0, &

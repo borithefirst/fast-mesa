@@ -55,7 +55,7 @@
          use hydro_temperature, only: do1_dlnT_dm_eqn
          use hydro_rsp2, only: do1_turbulent_energy_eqn, do1_rsp2_L_eqn, do1_rsp2_Hp_eqn
          use hydro_alpha_rti_eqns, only: do1_dalpha_RTI_dt_eqn
-         use eps_grav, only: zero_eps_grav_and_partials
+         use eps_grav, only: zero_eps_grav_and_partials, epsg_lin_report  ! savethesun epsg lin
          use profile, only: do_save_profiles
          use star_utils, only: show_matrix, &
             no_extra_profile_columns, no_data_for_extra_profile_columns
@@ -128,6 +128,7 @@
       ! solving structure equations
 
          call eos_memo_prepare(s)  ! savethesun eos memo
+         call epsg_lin_report(s)  ! savethesun epsg lin
 !$OMP PARALLEL DO PRIVATE(op_err,k) SCHEDULE(dynamic,2)
          do k = nzlo, nzhi
             op_err = 0

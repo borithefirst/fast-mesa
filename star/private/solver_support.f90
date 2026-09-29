@@ -182,6 +182,28 @@
       end subroutine eval_equations
 
 
+      real(dp) function resid_floor_factor()  ! savethesun resid floor: env MESA_RESID_FLOOR, 0 = off
+         logical, save :: checked = .false.
+         real(dp), save :: fac = 0d0
+         character(len=64) :: val
+         integer :: stat
+         if (.not. checked) then
+            !$OMP CRITICAL (savethesun_resid_floor)
+            if (.not. checked) then
+               call get_environment_variable('MESA_RESID_FLOOR', val, status=stat)
+               if (stat == 0 .and. len_trim(val) > 0) then
+                  read(val, *, iostat=stat) fac
+                  if (stat /= 0 .or. fac < 0d0) fac = 0d0
+               end if
+               if (fac > 0d0) write(*,'(a,f8.3)') 'savethesun: floor-aware residual norm, factor', fac
+               checked = .true.
+            end if
+            !$OMP END CRITICAL (savethesun_resid_floor)
+         end if
+         resid_floor_factor = fac
+      end function resid_floor_factor
+
+
       subroutine sizequ(s, nvar, equ_norm, equ_max, k_max, j_max, ierr)  ! equ = residuals
          type (star_info), pointer :: s
          integer, intent(in) :: nvar
@@ -190,6 +212,7 @@
 
          integer :: j, k, num_terms, n, nz, nvar_hydro, nvar_chem, skip_eqn1, skip_eqn2, skip_eqn3
          real(dp) :: sumequ, absq
+         real(dp) :: floor_fac  ! savethesun resid floor
 
          logical :: dbg
 
@@ -203,6 +226,8 @@
          j_max = 0
 
          dbg = s% solver_check_everything
+         floor_fac = resid_floor_factor()  ! savethesun resid floor
+         if (s% i_dlnE_dt <= 0 .or. s% i_lum <= 0) floor_fac = 0d0
 
          nvar_hydro = min(nvar, s% nvar_hydro)
          nvar_chem = s% nvar_chem
@@ -229,6 +254,8 @@
                      return
                   end if
                   absq = abs(s% equ(j,k)*s% residual_weight(j,k))
+                  if (floor_fac > 0d0 .and. j == s% i_dlnE_dt) absq = max(0d0, &
+                     absq - floor_fac*energy_floor(k)*abs(s% residual_weight(j,k)))  ! savethesun resid floor
                   sumequ = sumequ + absq
                   if (absq > equ_max) then
                      equ_max = absq
@@ -249,6 +276,8 @@
                do j = 1, nvar_hydro
                   if (j == skip_eqn1 .or. j == skip_eqn2) cycle
                   absq = abs(s% equ(j,k)*s% residual_weight(j,k))
+                  if (floor_fac > 0d0 .and. j == s% i_dlnE_dt) absq = max(0d0, &
+                     absq - floor_fac*energy_floor(k)*abs(s% residual_weight(j,k)))  ! savethesun resid floor
                   sumequ = sumequ + absq
                   if (is_bad(sumequ)) then
                      if (dbg) then
@@ -296,6 +325,21 @@
          call mesa_error(__FILE__,__LINE__,'sizequ')
 
          contains
+
+         real(dp) function energy_floor(k)  ! savethesun resid floor
+            ! residual quantum of the energy equation from one ULP in L(k) and L(k+1)
+            use star_utils, only: set_energy_eqn_scal
+            integer, intent(in) :: k
+            real(dp) :: scal, Lp1
+            integer :: ierr1
+            call set_energy_eqn_scal(s, k, scal, ierr1)
+            if (k < s% nz) then
+               Lp1 = s% L(k+1)
+            else
+               Lp1 = s% L_center
+            end if
+            energy_floor = abs(scal)*(spacing(abs(s% L(k))) + spacing(abs(Lp1)))/s% dm(k)
+         end function energy_floor
 
          subroutine dump_equ
             integer :: k, j

@@ -261,12 +261,13 @@
 
       subroutine eval_eps_grav_composition(s, k, eps_grav_composition_term, ierr)
          use auto_diff_support, only: wrap
-         use eos_support, only: get_eos
+         use eos_support, only: get_eos, get_eos_memo, eos_memo_count, eos_memo_stats_on  ! savethesun eos memo
          use eos_def, only: num_eos_basic_results, num_eos_d_dxa_results, i_lnE, i_lnPgas
 
          type (star_info), pointer :: s
          integer, intent(in) :: k
          type(auto_diff_real_star_order1), intent(out) :: eps_grav_composition_term
+         real(dp) :: memo_mx  ! savethesun eos memo
          integer, intent(out) :: ierr
          real(dp) :: &
             e, e_start, de, d_de_dlnd, d_de_dlnT, &
@@ -305,14 +306,30 @@
          end do
 
          e = s% energy(k)
-         call get_eos( &
-            s, k, s% xa_start(:,k), &
+         call get_eos_memo( &  ! savethesun eos memo
+            s, k, 1, s% xa_start(:,k), &
             s% rho(k), s% lnd(k)/ln10, s% T(k), s% lnT(k)/ln10, &
-            res, dres_dlnd, dres_dlnT, &
-            dres_dxa, ierr)
+            res, dres_dlnd, dres_dlnT, ierr)
          if (ierr /= 0) then
             if (s% report_ierr) write(*,2) 'failed in get_eos with xa_start', k
             return
+         end if
+         if (eos_memo_stats_on) then
+            call eos_memo_count(6)
+            if (s% eos_frac_PC(k) + s% eos_frac_Skye(k) + s% eos_frac_ideal(k) > 0) call eos_memo_count(15)
+            memo_mx = maxval(abs(s% xa(:,k) - s% xa_start(:,k)))
+            if (memo_mx == 0) then
+               call eos_memo_count(7)
+               if (exp(res(i_lnE)) == e) call eos_memo_count(8)
+            else if (memo_mx < 1d-12) then
+               call eos_memo_count(10)
+            else if (memo_mx < 1d-8) then
+               call eos_memo_count(11)
+            else if (memo_mx < 1d-4) then
+               call eos_memo_count(12)
+            else
+               call eos_memo_count(13)
+            end if
          end if
 
          e_with_xa_start = exp(res(i_lnE))
@@ -327,17 +344,19 @@
 
             e_start = s% energy_start(k)
 
-            call get_eos( &
-               s, k, s% xa(:,k), &
+            call get_eos_memo( &  ! savethesun eos memo
+               s, k, 2, s% xa(:,k), &
                s% rho_start(k), s% lnd_start(k)/ln10, s% T_start(k), s% lnT_start(k)/ln10, &
-               res, dres_dlnd, dres_dlnT, &
-               dres_dxa, ierr)
+               res, dres_dlnd, dres_dlnT, ierr)
             if (ierr /= 0) then
                if (s% report_ierr) write(*,2) 'failed in get_eos with xa_start', k
                return
             end if
 
             e_with_DT_start = exp(res(i_lnE))
+            if (eos_memo_stats_on) then
+               if (memo_mx == 0 .and. e_with_DT_start == e_start) call eos_memo_count(9)
+            end if
             de = theta * de + (1d0 - theta) * (e_with_DT_start - e_start)
             d_de_dlnd = theta * d_de_dlnd
             d_de_dlnT = theta * d_de_dlnT

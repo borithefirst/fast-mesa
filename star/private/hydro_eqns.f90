@@ -25,6 +25,9 @@
       use utils_lib, only: mesa_error, is_bad
       use auto_diff
       use auto_diff_support
+      use eos_support, only: eos_memo_prepare, get_eos_memo, eos_memo_count, eos_fixd_minstep, eos_fixd_minx, &  ! savethesun eos memo
+         eos_dxa_tangent_on, eos_dxa_tangent_partials, eos_skye_dxa_on, eos_skye_dxa_check, &
+         eos_skye_dxa_check_cell
 
       implicit none
 
@@ -124,6 +127,7 @@
 
       ! solving structure equations
 
+         call eos_memo_prepare(s)  ! savethesun eos memo
 !$OMP PARALLEL DO PRIVATE(op_err,k) SCHEDULE(dynamic,2)
          do k = nzlo, nzhi
             op_err = 0
@@ -396,6 +400,7 @@
             real(dp) :: lnE_with_xa_start, lnPgas_with_xa_start
 
             integer :: i_var, i_var_sink
+            logical :: memo_forced  ! savethesun eos memo
 
             real(dp), parameter :: dxa_threshold = 1d-4
 
@@ -408,6 +413,9 @@
             ! some EOSes have composition partials and some do not
             ! those currently without dx partials are PC & Skye & ideal
             frac_without_dxa = s% eos_frac_PC(k) + s% eos_frac_Skye(k) + s% eos_frac_ideal(k)
+            ! savethesun eos memo: with MESA_SKYE_DXA=1 Skye provides analytic d_dxa (eos/private/skye.f90 patch)
+            if (eos_skye_dxa_check .and. s% eos_frac_Skye(k) == 1d0) call eos_skye_dxa_check_cell(s, k)
+            if (eos_skye_dxa_on) frac_without_dxa = frac_without_dxa - s% eos_frac_Skye(k)
 
             if (debug .and. k == s% solver_test_partials_k) then
               write(*,2) 's% eos_frac_PC(k)', k, s% eos_frac_PC(k)
@@ -427,21 +435,38 @@
             ! approximate derivatives with finite differences
             if (frac_without_dxa > 0) then
 
+               call eos_memo_count(4)  ! savethesun eos memo
+               if (eos_dxa_tangent_on) then
+                  call eos_dxa_tangent_partials(s, k, ierr)
+                  return
+               end if
                do j=1, s% species
                   dxa = s% xa(j,k) - s% xa_start(j,k)
+                  ! savethesun eos memo: diagnostic MESA_FIXD_MINSTEP=h: also FD the species with |dxa| < threshold,
+                  ! with step h (skipped if the step would cross Skye's 1e-4 relevant-species limit)
+                  memo_forced = .false.
+                  if (eos_fixd_minstep > 0 .and. abs(dxa) < dxa_threshold .and. &
+                      s% xa_start(j,k) >= eos_fixd_minx) then
+                     if (.not. (s% xa_start(j,k) <= 1d-4 .and. s% xa_start(j,k) + eos_fixd_minstep > 1d-4)) then
+                        dxa = eos_fixd_minstep
+                        memo_forced = .true.
+                     end if
+                  end if
 
                   if (debug .and. k == s% solver_test_partials_k .and. &
                         s% solver_iter == s% solver_test_partials_iter_number) &
                      write(*,2) 'dxa', j, dxa
 
-                  if (abs(dxa) >= dxa_threshold) then
+                  if (abs(dxa) >= dxa_threshold .or. memo_forced) then  ! savethesun eos memo
 
                      ! first, get eos with xa_start
 
-                     call get_eos( &
-                        s, k, s% xa_start(:,k), &
+                     ! savethesun eos memo: identical for every j (and to eps_grav's call 1)
+                     call eos_memo_count(5)
+                     call get_eos_memo( &
+                        s, k, 1, s% xa_start(:,k), &
                         s% rho(k), s% lnd(k)/ln10, s% T(k), s% lnT(k)/ln10, &
-                        res, dres_dlnd, dres_dlnT, dres_dxa, ierr)
+                        res, dres_dlnd, dres_dlnT, ierr)
                      if (ierr /= 0) then
                         if (s% report_ierr) write(*,2) 'failed in get_eos with xa_start', k
                         return

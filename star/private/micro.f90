@@ -354,11 +354,13 @@ contains
           s% solver_iter == s% solver_test_partials_iter_number )
     end if
 
+    eos_want_skye_dxa = .true.  ! savethesun eos memo
     call get_eos( &
          s, k, s% xa(:,k), &
          s% rho(k), logRho, s% T(k), logT, &
          res, s% d_eos_dlnd(:,k), s% d_eos_dlnT(:,k), &
          s% d_eos_dxa(:,:,k), ierr)
+    eos_want_skye_dxa = .false.
     if (ierr /= 0) then
        if (s% report_ierr) then
           write(*, *) s% retry_message
@@ -367,6 +369,9 @@ contains
        if (s% stop_for_bad_nums) call mesa_error(__FILE__,__LINE__,'do_eos_for_cell')
        return
     end if
+
+    call eos_memo_store(s, k, 1, s% xa(:,k), s% rho(k), logRho, s% T(k), logT, &  ! savethesun eos memo
+       res, s% d_eos_dlnd(:,k), s% d_eos_dlnT(:,k))
 
     if (s% solver_test_eos_partials .and. eos_test_partials) then
        s% solver_test_partials_val = eos_test_partials_val

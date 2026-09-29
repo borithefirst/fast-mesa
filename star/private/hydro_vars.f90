@@ -41,6 +41,8 @@
 
       logical, parameter :: dbg = .false.
       logical, parameter :: trace_setvars = .false.
+      logical :: lazy_brunt_skip = .false.  ! savethesun lazy brunt: set only around set_vars
+      !$OMP THREADPRIVATE(lazy_brunt_skip)
 
       contains
 
@@ -80,12 +82,40 @@
          call reset_starting_vectors(s)
          skip_set_cz_bdy_mass = .not. s% have_new_generation
          skip_mixing_info = .not. s% okay_to_set_mixing_info
+         lazy_brunt_skip = lazy_brunt_ok(s)  ! savethesun lazy brunt
          call set_some_vars( &
             s, skip_m_grav_and_grav, &
             skip_net, skip_neu, skip_kap, skip_grads, skip_rotation, &
             skip_brunt, skip_mixing_info, skip_set_cz_bdy_mass, skip_irradiation_heat, &
             dt, ierr)
+         lazy_brunt_skip = .false.  ! savethesun lazy brunt
       end subroutine set_vars
+
+
+      logical function lazy_brunt_ok(s)  ! savethesun lazy brunt: env MESA_LAZY_BRUNT=1
+         type (star_info), pointer :: s
+         logical, save :: checked = .false., on = .false.
+         character(len=16) :: val
+         integer :: stat
+         if (.not. checked) then
+            !$OMP CRITICAL (savethesun_lazy_brunt)
+            if (.not. checked) then
+               call get_environment_variable('MESA_LAZY_BRUNT', val, status=stat)
+               on = (stat == 0 .and. len_trim(val) > 0 .and. trim(val) /= '0')
+               if (on) write(*,'(a)') 'savethesun: lazy Brunt B (skipped in set_vars when unused in-step)'
+               checked = .true.
+            end if
+            !$OMP END CRITICAL (savethesun_lazy_brunt)
+         end if
+         lazy_brunt_ok = on .and. s% calculate_Brunt_B &
+            .and. .not. s% use_Ledoux_criterion &
+            .and. .not. s% rotation_flag &
+            .and. .not. (s% overshoot_brunt_B_max > 0d0) &
+            .and. .not. s% do_phase_separation &
+            .and. .not. s% RSP_flag .and. .not. s% RSP2_flag &
+            .and. .not. s% use_other_brunt .and. .not. s% use_other_brunt_smoothing &
+            .and. .not. s% use_other_D_mix .and. .not. s% use_other_am_mixing
+      end function lazy_brunt_ok
 
 
       subroutine set_final_vars(s, dt, ierr)
@@ -544,8 +574,13 @@
 
          if (.not. skip_grads) then
             if (dbg) write(*,*) 'call do_brunt_B'
+            if (lazy_brunt_skip) then  ! savethesun lazy brunt: recomputed in set_final_vars
+               s% brunt_B(1:s% nz) = 0d0
+               s% unsmoothed_brunt_B(1:s% nz) = 0d0
+            else
             call do_brunt_B(s, nzlo, nzhi, ierr)  ! for unsmoothed_brunt_B
             if (failed('do_brunt_B')) return
+            end if
             if (dbg) write(*,*) 'call set_grads'
             call set_grads(s, ierr)
             if (failed('set_grads')) return

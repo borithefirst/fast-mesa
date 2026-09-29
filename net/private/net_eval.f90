@@ -28,6 +28,10 @@
 
       implicit none
 
+      ! savethesun screening dxa: opt-in via MESA_SCREEN_DXA=1 (FD prototype) or 2 (v2)
+      logical, save :: scr_dxa_checked = .false.
+      integer, save :: scr_dxa_mode = 0
+
       contains
 
       subroutine eval_net( &
@@ -92,6 +96,10 @@
          integer :: ci, i, j, ir, weak_id, h1, iwork
          integer(i8) :: time0, time1
          logical :: doing_timing
+         logical :: do_scr_dxa  ! savethesun screening dxa
+         real(dp) :: scr_dydt_dp(num_isos,3), scr_deps_dp(3)
+         real(dp) :: scr_h(3), scr_rs0(num_reactions), scr_rsp(num_reactions,3)
+         integer :: scr_np
 
          logical, parameter :: dbg = .false.
          !logical, parameter :: dbg = .true.
@@ -211,6 +219,20 @@
          ! n% d_dxdt_dRho(:) = 0
          ! n% d_dxdt_dT(:) = 0
          ! if (.not. just_dxdt) d_dxdt_dx(:,:) = 0
+         do_scr_dxa = .false.  ! savethesun screening dxa
+         if (.not. (just_dxdt .or. symbolic .or. g% doing_approx21)) then
+            call scr_dxa_init()
+            do_scr_dxa = scr_dxa_mode > 0
+         end if
+         if (do_scr_dxa) then
+            if (scr_dxa_mode == 1) then
+               call scr_dxa_derivs(n, num_isos, num_reactions, scr_dydt_dp, scr_deps_dp, ierr)
+            else
+               call scr2_screen(n, num_reactions, scr_np, scr_h, scr_rs0, scr_rsp, ierr)
+            end if
+            if (ierr /= 0) return
+         end if
+
          n% eps_nuc_categories(:) = 0
          n% eps_neu_total = 0
          n% d_eps_nuc_dy = 0
@@ -275,6 +297,14 @@
          end do
 
          if (.not. just_dxdt) call store_partials(n)
+         if (do_scr_dxa) then  ! savethesun screening dxa
+            if (scr_dxa_mode == 2) then
+               call scr2_derivs(n, num_isos, num_reactions, scr_np, scr_h, scr_rs0, scr_rsp, &
+                  scr_dydt_dp, scr_deps_dp, ierr)
+               if (ierr /= 0) return
+            end if
+            call scr_dxa_apply(n, num_isos, scr_dydt_dp, scr_deps_dp)
+         end if
 
          n% eps_nuc = eps_nuc_MeV(i_rate)*Qconv
          n% d_eps_nuc_dT = eps_nuc_MeV(i_rate_dT)*Qconv
@@ -550,6 +580,202 @@
          Qtotal = n% reaction_Qs(ir)
          Qneu = n% reaction_neuQs(ir)
       end subroutine get_Qs_rfe56ec
+
+      subroutine scr_dxa_init()  ! savethesun screening dxa
+         character (len=16) :: val
+         integer :: stat
+         if (scr_dxa_checked) return
+!$omp critical (savethesun_scr_dxa_init)
+         if (.not. scr_dxa_checked) then
+            call get_environment_variable('MESA_SCREEN_DXA', val, status=stat)
+            scr_dxa_mode = 0
+            if (stat == 0 .and. trim(val) == '1') scr_dxa_mode = 1
+            if (stat == 0 .and. trim(val) == '2') scr_dxa_mode = 2
+            if (scr_dxa_mode > 0) write(*,'(a,i2)') 'savethesun: screening composition partials ON, mode', &
+               scr_dxa_mode
+            scr_dxa_checked = .true.
+         end if
+!$omp end critical (savethesun_scr_dxa_init)
+      end subroutine scr_dxa_init
+
+
+      subroutine scr_dxa_derivs(n, num_isos, num_reactions, dydt_dp, deps_dp, ierr)  ! savethesun screening dxa
+         ! d(dydt(i_rate,:), eps_nuc_MeV(i_rate)) / d(zbar, abar, z2bar), through the screening
+         ! factors only. Rates enter dydt and eps linearly, so this is exact up to the
+         ! finite-difference step in the (smooth) screening functions.
+         use const_def, only: qp
+         use rates_def, only: i_rate, num_rvs
+         use net_screen, only: screen_net
+         use net_derivs, only: get_derivs
+         type(net_info) :: n
+         integer, intent(in) :: num_isos, num_reactions
+         real(dp), intent(out) :: dydt_dp(:,:), deps_dp(:)
+         integer, intent(out) :: ierr
+         type(net_general_info), pointer :: g
+         real(dp), dimension(num_reactions) :: rs, rs_dT, rs_dRho
+         real(qp) :: dydt(num_rvs, num_isos), eps(num_rvs), dydt0(num_isos), eps0
+         real(dp) :: p(3), h
+         integer :: ip
+         g => n% g
+         ierr = 0
+         dydt_dp = 0d0
+         deps_dp = 0d0
+         rs = n% rate_screened(1:num_reactions)
+         rs_dT = n% rate_screened_dT(1:num_reactions)
+         rs_dRho = n% rate_screened_dRho(1:num_reactions)
+         call get_derivs( &
+            n, dydt, eps, n% eta, n% ye, n% logT, n% temp, n% rho, n% abar, n% zbar, &
+            num_reactions, n% rate_factors, .false., .true., ierr)
+         if (ierr /= 0) return
+         dydt0 = dydt(i_rate,:)
+         eps0 = eps(i_rate)
+         do ip = 1, 3
+            p = [n% zbar, n% abar, n% z2bar]
+            h = 1d-6*p(ip)
+            p(ip) = p(ip) + h
+            call screen_net( &
+               g, g% num_isos, n% y, n% temp, n% rho, n% logT, n% logRho, .false., &
+               n% rate_raw, n% rate_raw_dT, n% rate_raw_dRho, &
+               n% rate_screened, n% rate_screened_dT, n% rate_screened_dRho, &
+               n% screening_mode, p(1), p(2), p(3), n% ye, ierr)
+            if (ierr /= 0) exit
+            call get_derivs( &
+               n, dydt, eps, n% eta, n% ye, n% logT, n% temp, n% rho, n% abar, n% zbar, &
+               num_reactions, n% rate_factors, .false., .true., ierr)
+            if (ierr /= 0) exit
+            dydt_dp(1:num_isos,ip) = real((dydt(i_rate,:) - dydt0)/h, dp)
+            deps_dp(ip) = real((eps(i_rate) - eps0)/h, dp)
+         end do
+         n% rate_screened(1:num_reactions) = rs
+         n% rate_screened_dT(1:num_reactions) = rs_dT
+         n% rate_screened_dRho(1:num_reactions) = rs_dRho
+      end subroutine scr_dxa_derivs
+
+
+      subroutine scr_dxa_apply(n, num_isos, dydt_dp, deps_dp)  ! savethesun screening dxa
+         ! chain rule: abar = sumx/sum(y), zbar = abar*sum(y*Z), z2bar = abar*sum(y*Z^2), y = x/A
+         type(net_info) :: n
+         integer, intent(in) :: num_isos
+         real(dp), intent(in) :: dydt_dp(:,:), deps_dp(:)
+         type(net_general_info), pointer :: g
+         real(dp) :: sumx, a_i, a_j, z_j, dp_dx(3)
+         integer :: i, j
+         g => n% g
+         sumx = sum(n% x(1:num_isos))
+         do j = 1, num_isos
+            a_j = dble(chem_isos% Z_plus_N(g% chem_id(j)))
+            z_j = dble(chem_isos% Z(g% chem_id(j)))
+            dp_dx(1) = n% zbar*(a_j - n% abar)/(a_j*sumx) + n% abar*z_j/a_j  ! d zbar/d x_j
+            dp_dx(2) = n% abar*(a_j - n% abar)/(a_j*sumx)  ! d abar/d x_j
+            dp_dx(3) = n% z2bar*(a_j - n% abar)/(a_j*sumx) + n% abar*z_j*z_j/a_j  ! d z2bar/d x_j
+            n% d_eps_nuc_dx(j) = n% d_eps_nuc_dx(j) + Qconv*sum(deps_dp(1:3)*dp_dx)
+            do i = 1, num_isos
+               a_i = dble(chem_isos% Z_plus_N(g% chem_id(i)))
+               n% d_dxdt_dx(i,j) = n% d_dxdt_dx(i,j) + a_i*sum(dydt_dp(i,1:3)*dp_dx)
+            end do
+         end do
+      end subroutine scr_dxa_apply
+
+
+      subroutine scr2_screen(n, num_reactions, np, h, rs0, rsp, ierr)  ! savethesun screening dxa v2
+         ! screened rates at composition-perturbed (zbar, abar[, z2bar]); n's rates are restored on exit
+         use rates_def, only: chugunov_screening
+         use net_screen, only: screen_net
+         type(net_info) :: n
+         integer, intent(in) :: num_reactions
+         integer, intent(out) :: np, ierr
+         real(dp), intent(out) :: h(3), rs0(:), rsp(:,:)
+         type(net_general_info), pointer :: g
+         real(dp), dimension(num_reactions) :: rs_dT, rs_dRho
+         real(dp) :: p(3), p0(3)
+         integer :: ip
+         g => n% g
+         ierr = 0
+         np = 3
+         if (n% screening_mode == chugunov_screening) np = 2  ! Chugunov: zbar, abar only
+         h = 0d0
+         rsp = 0d0
+         rs0 = n% rate_screened(1:num_reactions)
+         rs_dT = n% rate_screened_dT(1:num_reactions)
+         rs_dRho = n% rate_screened_dRho(1:num_reactions)
+         p0 = [n% zbar, n% abar, n% z2bar]
+         do ip = 1, np
+            p = p0
+            p(ip) = p0(ip) + 1d-6*p0(ip)
+            h(ip) = p(ip) - p0(ip)  ! the step actually taken
+            call screen_net( &
+               g, g% num_isos, n% y, n% temp, n% rho, n% logT, n% logRho, .false., &
+               n% rate_raw, n% rate_raw_dT, n% rate_raw_dRho, &
+               n% rate_screened, n% rate_screened_dT, n% rate_screened_dRho, &
+               n% screening_mode, p(1), p(2), p(3), n% ye, ierr)
+            if (ierr /= 0) exit
+            rsp(:,ip) = n% rate_screened(1:num_reactions)
+         end do
+         n% rate_screened(1:num_reactions) = rs0
+         n% rate_screened_dT(1:num_reactions) = rs_dT
+         n% rate_screened_dRho(1:num_reactions) = rs_dRho
+      end subroutine scr2_screen
+
+
+      subroutine scr2_derivs(n, num_isos, num_reactions, np, h, rs0, rsp, dydt_dp, deps_dp, ierr)  ! savethesun screening dxa v2
+         ! after the main get_derivs: d(dydt, eps_nuc_MeV)/dp through the screening factors
+         use const_def, only: qp
+         use rates_def, only: i_rate, num_rvs, ir_he4_he4_he4_to_c12
+         use net_derivs, only: get_derivs
+         type(net_info) :: n
+         integer, intent(in) :: num_isos, num_reactions, np
+         real(dp), intent(in) :: h(3), rs0(:), rsp(:,:)
+         real(dp), intent(out) :: dydt_dp(:,:), deps_dp(:)
+         integer, intent(out) :: ierr
+         type(net_general_info), pointer :: g
+         real(qp) :: dydt(num_rvs, num_isos), eps(num_rvs)
+         real(dp), dimension(num_reactions) :: rs_m, rs_m_dT, rs_m_dRho
+         real(dp), allocatable :: raw_s(:), scr_s(:), enr_s(:), eneu_s(:), cat_s(:)
+         real(dp) :: s, eneu_tot
+         integer :: ip, i
+         g => n% g
+         ierr = 0
+         dydt_dp = 0d0
+         deps_dp = 0d0
+         ! eps_nuc: each reaction's eps_nuc_rate is linear in its own screened rate
+         do ip = 1, np
+            s = 0d0
+            do i = 1, num_reactions
+               if (rs0(i) == 0d0) cycle
+               if (g% use_3a_fl87 .and. g% reaction_id(i) == ir_he4_he4_he4_to_c12) cycle
+               s = s + n% eps_nuc_rate(i)*((rsp(i,ip) - rs0(i))/rs0(i))
+            end do
+            deps_dp(ip) = s/(h(ip)*Qconv)  ! MeV units, as eps_nuc_MeV
+         end do
+         ! dydt: linear in the screened rates; difference against the main call's n% dydt
+         rs_m = n% rate_screened(1:num_reactions)
+         rs_m_dT = n% rate_screened_dT(1:num_reactions)
+         rs_m_dRho = n% rate_screened_dRho(1:num_reactions)
+         raw_s = n% raw_rate
+         scr_s = n% screened_rate
+         enr_s = n% eps_nuc_rate
+         eneu_s = n% eps_neu_rate
+         cat_s = n% eps_nuc_categories
+         eneu_tot = n% eps_neu_total
+         do ip = 1, np
+            n% rate_screened(1:num_reactions) = rsp(:,ip)
+            call get_derivs( &
+               n, dydt, eps, n% eta, n% ye, n% logT, n% temp, n% rho, n% abar, n% zbar, &
+               num_reactions, n% rate_factors, .false., .true., ierr)
+            if (ierr /= 0) exit
+            dydt_dp(1:num_isos,ip) = real((dydt(i_rate,1:num_isos) - n% dydt(i_rate,1:num_isos))/h(ip), dp)
+         end do
+         n% rate_screened(1:num_reactions) = rs_m
+         n% rate_screened_dT(1:num_reactions) = rs_m_dT
+         n% rate_screened_dRho(1:num_reactions) = rs_m_dRho
+         n% raw_rate = raw_s
+         n% screened_rate = scr_s
+         n% eps_nuc_rate = enr_s
+         n% eps_neu_rate = eneu_s
+         n% eps_nuc_categories = cat_s
+         n% eps_neu_total = eneu_tot
+      end subroutine scr2_derivs
+
 
       subroutine store_partials(n)
          use rates_def, only: i_rate, i_rate_dT, i_rate_dRho

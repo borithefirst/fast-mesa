@@ -105,7 +105,13 @@ contains
 
   subroutine math_init ()
 
+    interface  ! savethesun fastcr: keeps the MESA_FAST_CRLIBM exp/log front end linked
+       subroutine savethesun_fastcr_link() bind(C, name='savethesun_fastcr_link')
+       end subroutine savethesun_fastcr_link
+    end interface
+
     call crmath_init()
+    call savethesun_fastcr_link()
 
     ln10_m = log(10._dp)
 

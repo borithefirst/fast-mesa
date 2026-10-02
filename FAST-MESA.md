@@ -53,6 +53,25 @@ saved by `MESA_FAST_CRLIBM`, which shortens latency more than it removes instruc
 - **After the AGB:** thermal pulses amplify any perturbation. The final WD mass changes by 0.09% (5e-4 Msun),
   the same order as the 1%-timestep run (2e-4 Msun).
 
+**MESA's own test suite** (19 targeted tests, MESA's unmodified `each_test_run`: exit code, stderr,
+termination string, restart checksum):
+- **Selection:** a static scan of all 106 tests (star, binary, astero) picked the ones that exercise the
+  changed code. Examples:
+  - lazy Brunt with Brunt read by test code or GYRE;
+  - a custom EOS hook;
+  - two stars sharing the EOS memo (binary);
+  - accreting white dwarfs and neutron-star envelopes (Skye, eps_grav form, mass change);
+  - tests that check values against tolerances.
+- **Bit-identity:** with only the bit-identical switches on (memo, lazy Brunt, fastcr), the final model and
+  full history are byte-identical to all-off in 7/7 tests.
+- **Defaults:** 19/19 pass, including the restart checksums. Newton iterations usually drop 35–60%.
+- **Accuracy:** where end states differ, they are within the spread of stock MESA rerun with a 1% smaller or
+  larger timestep. The tests that stop mid-runaway (nova burst, AIC, C/He ignition, carbon flame) are the
+  most sensitive. One quantity sits at about 2× that spread: `wd_aic`'s central temperature at the
+  runaway stop.
+- **Caveat:** `ns_he` is fragile in stock MESA itself, which fails it with a 1% smaller timestep. Its retry
+  count varies 2–29 across small changes, so per-run speed on it is noise.
+
 ## What changed
 
 Each change is a separate commit, so `git log 25.12.1..fast-mesa` is the full list. The speedups are **on by
